@@ -6,7 +6,6 @@ from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 import json
 import operator
-import uuid
 import trafilatura
 import requests
 from pypdf import PdfReader
@@ -14,7 +13,6 @@ from pypdf import PdfReader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 
-from langgraph.types import Command, interrupt
 from langgraph.graph import StateGraph, START, END
 #paralle agent calling 
 from langgraph.constants import Send
@@ -29,17 +27,17 @@ from langchain_core.messages import (
     SystemMessage,
 )
 
-from langchain_huggingface import (
-    ChatHuggingFace,
-    HuggingFaceEndpoint,
-)
+# Hugging Face integration is kept for future fallback/use. Groq is the
+# active provider below.
+# from langchain_huggingface import (
+#     ChatHuggingFace,
+#     HuggingFaceEndpoint,
+# )
+
+from langchain_groq import ChatGroq
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
-from pymongo import MongoClient
-from pymongo.errors import PyMongoError
-from langgraph.checkpoint.mongodb import MongoDBSaver
-from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.prompts import ChatPromptTemplate
 
 
@@ -58,53 +56,64 @@ os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
 # LLM
 # =========================================================
 
-HUGGINGFACE_TOKEN = os.getenv(
-    "HUGGINGFACEHUB_ACCESS_TOKEN"
-)
+# -------------------------------------------------------------------------
+# Hugging Face configuration (kept, but currently disabled)
+# -------------------------------------------------------------------------
+# HUGGINGFACE_TOKEN = os.getenv(
+#     "HUGGINGFACEHUB_ACCESS_TOKEN"
+# )
+#
+# if not HUGGINGFACE_TOKEN:
+#     raise ValueError(
+#         "HUGGINGFACEHUB_ACCESS_TOKEN is missing from .env"
+#     )
+#
+# llm = HuggingFaceEndpoint(
+#     # This is configurable because not every Hugging Face model is
+#     # available through the hosted inference provider.  The NVIDIA
+#     # NVFP4 model is primarily intended for local/deployed inference.
+#     repo_id=os.getenv(
+#         "HF_MODEL_ID",
+#         "meta-llama/Llama-3.1-8B-Instruct"
+#     ),
+#     task="text-generation",
+#     huggingfacehub_api_token=HUGGINGFACE_TOKEN,
+#     max_new_tokens=1024,
+#     temperature=0.7,
+# )
+#
+# model = ChatHuggingFace(
+#     llm=llm
+# )
 
-if not HUGGINGFACE_TOKEN:
+
+# =========================================================
+# ACTIVE LLM: GROQ
+# =========================================================
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+
+if not GROQ_API_KEY:
     raise ValueError(
-        "HUGGINGFACEHUB_ACCESS_TOKEN is missing from .env"
+        "GROQ_API_KEY is missing from .env"
     )
 
 
-llm = HuggingFaceEndpoint(
-    # This is configurable because not every Hugging Face model is
-    # available through the hosted inference provider.  The NVIDIA
-    # NVFP4 model is primarily intended for local/deployed inference.
-    repo_id=os.getenv(
-        "HF_MODEL_ID",
-        "meta-llama/Llama-3.1-8B-Instruct"
-    ),
-    task="text-generation",
-    huggingfacehub_api_token=HUGGINGFACE_TOKEN,
-    max_new_tokens=1024,
-    temperature=0.7,
-)
-
-model = ChatHuggingFace(
-    llm=llm
+# ChatGroq preserves the existing model.invoke(...) interface used by all
+# guardrail, supervisor, research, and report agents.
+model = ChatGroq(
+    model="openai/gpt-oss-120b",
+    api_key=GROQ_API_KEY,
+    temperature=1,
+    max_tokens=2048,
+    reasoning_effort="medium",
+    streaming=False,
 )
 
 
 # =========================================================
 # DATABASE
 # =========================================================
-
-def get_database_url():
-
-    database_url = (
-        os.getenv("MONGODB_URI")
-        or os.getenv("DATABASE_URL")
-    )
-
-    if not database_url:
-        raise ValueError(
-            "MONGODB_URI is missing. Add it to .env"
-        )
-
-    return database_url
-
 
 # =========================================================
 # MCP CLIENT
@@ -315,6 +324,8 @@ class ResearchState(TypedDict):
     research_constraints: dict[str, Any]
 
     supervisor_reasoning: str
+    supervisor_failed: bool
+    supervisor_error: str
 
     # Research results
     web_results: str
@@ -322,14 +333,18 @@ class ResearchState(TypedDict):
     news_results: str
     youtube_results: str
 
-    # Analysis
-    analysis_results: str
-
-    # HITL
+    # Report
     draft_report: str
-    approval_request: str
-    approved: bool
-    human_feedback: str
+    combined_research_context: str
+    analysis_context: str
+    analysis_route: str
+    context_token_estimate: int
+
+    # Revision
+    revision_requires_research: bool
+    revision_query: str
+    revision_reason: str
+
 
     # Final
     final_response: str
@@ -345,8 +360,7 @@ KNOWN_AGENTS = {
     "web_research_agent",
     "paper_research_agent",
     "news_research_agent",
-    "youtube_research_agent",
-    "analysis_agent"
+    "youtube_research_agent"
 }
 
 
@@ -354,8 +368,7 @@ AGENT_ORDER = [
     "web_research_agent",
     "paper_research_agent",
     "news_research_agent",
-    "youtube_research_agent",
-    "analysis_agent"
+    "youtube_research_agent"
    
     
 ]
@@ -471,6 +484,95 @@ def _json_from_llm(text: str):
 # =========================================================
 # SUPERVISOR
 # =========================================================
+def guardrail_agent(state: ResearchState):
+    """Validate the user request before sending it to the supervisor."""
+
+    query = state["user_query"]
+
+    llm_calls = state.get("llm_calls", 0)
+
+    # -----------------------------------------------------
+    # GUARDRAIL
+    # -----------------------------------------------------
+
+    guardrail_prompt = f"""
+    Determine whether the following request is suitable
+    for an AI research assistant.
+    
+    Allow requests asking for:
+    - research
+    - factual information
+    - academic information
+    - technology
+    - science
+    - business
+    - current events
+    - literature
+    - comparisons
+    - reports
+    - general knowledge
+    
+    Block harmful or clearly inappropriate requests.
+    Do not block a normal research topic merely because it could be
+    more specific. If the request names a subject or asks for research,
+    allow it.
+    
+    Return strict JSON:
+    
+    {{
+        "allowed": true,
+        "reason": ""
+    }}
+    
+    User request:
+    {query}
+    """
+    
+    try:
+        raw = _llm_text(
+            "You are a research input guardrail. Return strict JSON only.",
+            guardrail_prompt,
+        )
+        result = _json_from_llm(raw)
+
+        if not isinstance(result, dict):
+            raise ValueError("Guardrail response must be a JSON object.")
+
+        allowed_value = result.get("allowed", True)
+        if isinstance(allowed_value, str):
+            allowed = allowed_value.strip().lower() in {
+                "true",
+                "yes",
+                "allow",
+                "allowed",
+            }
+        else:
+            allowed = bool(allowed_value)
+
+        reason = str(result.get("reason", "")).strip()
+        llm_calls += 1
+    except Exception as exc:
+        print(
+            f"Guardrail fallback used: {type(exc).__name__}: {exc}"
+        )
+        allowed = True
+        reason = "Guardrail fallback allowed the request."
+
+    if not reason:
+        reason = "Request allowed." if allowed else "Request blocked."
+
+    # Always return a state update. Returning None for allowed requests makes
+    # LangGraph fail before the supervisor can run.
+    return {
+        "guardrail_allowed": allowed,
+        "guardrail_reason": reason,
+        "selected_agents": [] if not allowed else state.get("selected_agents", []),
+        "research_constraints": empty_constraints(),
+        "supervisor_reasoning": reason if not allowed else state.get("supervisor_reasoning", ""),
+        "final_response": reason if not allowed else state.get("final_response", ""),
+        "messages": [AIMessage(content=reason)],
+        "llm_calls": llm_calls,
+    }
 
 def supervisor_agent(
     state: ResearchState
@@ -478,106 +580,8 @@ def supervisor_agent(
 
 
     query = state["user_query"]
-
-    llm_calls = state.get(
-        "llm_calls",
-        0
-    )
-
-    # -----------------------------------------------------
-    # GUARDRAIL
-    # -----------------------------------------------------
-
-    guardrail_prompt = f"""
-Determine whether the following request is suitable
-for an AI research assistant.
-
-Allow requests asking for:
-- research
-- factual information
-- academic information
-- technology
-- science
-- business
-- current events
-- literature
-- comparisons
-- reports
-- general knowledge
-
-Block harmful or clearly inappropriate requests.
-Do not block a normal research topic merely because it could be
-more specific. If the request names a subject or asks for research,
-allow it.
-
-Return strict JSON:
-
-{{
-    "allowed": true,
-    "reason": ""
-}}
-
-User request:
-{query}
-"""
-
-    try:
-
-        raw = _llm_text(
-            "You are a research input guardrail. "
-            "Return strict JSON only.",
-            guardrail_prompt
-        )
-
-        result = _json_from_llm(raw)
-
-        allowed = bool(
-            result.get(
-                "allowed",
-                True
-            )
-        )
-
-        reason = str(
-            result.get(
-                "reason",
-                ""
-            )
-        ).strip()
-
-        llm_calls += 1
-
-    except Exception as exc:
-
-        print(
-            f"Guardrail fallback used: "
-            f"{type(exc).__name__}: {exc}"
-        )
-
-        allowed = True
-
-        reason = (
-            "Guardrail fallback allowed the request."
-        )
-
-    if not allowed:
-
-        return {
-            "guardrail_allowed": False,
-            "guardrail_reason": reason,
-            "selected_agents": [],
-            "research_constraints":
-                empty_constraints(),
-            "supervisor_reasoning": reason,
-            "final_response": reason,
-            "messages": [
-                AIMessage(
-                    content=reason
-                )
-            ],
-            "llm_calls": llm_calls,
-        }
-
+    reason = state["guardrail_reason"]
+    llm_calls = state.get("llm_calls", 0)
     # -----------------------------------------------------
     # SUPERVISOR
     # -----------------------------------------------------
@@ -603,22 +607,13 @@ Available agents:
 - youtube_research_agent:
   searches relevant YouTube videos and transcripts
 
-- analysis_agent:
-  analyzes and creates the final research response
-
-
-  
-
-Always include analysis_agent and report_agent.
-
 Return strict JSON:
 
 {{
     "selected_agents": [
         "web_research_agent",
         "paper_research_agent",
-        "news_research_agent",
-        "analysis_agent"
+        "news_research_agent"
         
     ],
     "research_constraints": {{
@@ -656,11 +651,6 @@ User request:
             if agent in requested
         ]
 
-        if "analysis_agent" not in selected_agents:
-            selected_agents.append(
-                "analysis_agent"
-            )
-
         # if "report_agent" not in selected_agents:
         #     selected_agents.append(
         #         "report_agent"
@@ -693,18 +683,29 @@ User request:
     except Exception as exc:
 
         print(
-            f"Supervisor fallback used: "
-            f"{type(exc).__name__}: {exc}"
+            f"Supervisor failed: {type(exc).__name__}: {exc}"
         )
 
-        selected_agents = AGENT_ORDER.copy()
-
+        error_message = (
+            "Unable to process your request because the supervisor "
+            "encountered a temporary error. Please try again later."
+        )
+        selected_agents = []
         constraints = empty_constraints()
+        reasoning = error_message
 
-        reasoning = (
-            "Supervisor parsing failed. "
-            "Full research workflow selected."
-        )
+        return {
+            "guardrail_allowed": True,
+            "guardrail_reason": reason,
+            "selected_agents": [],
+            "research_constraints": constraints,
+            "supervisor_reasoning": reasoning,
+            "supervisor_failed": True,
+            "supervisor_error": error_message,
+            "final_response": error_message,
+            "messages": [AIMessage(content=error_message)],
+            "llm_calls": llm_calls,
+        }
 
     return {
 
@@ -717,6 +718,8 @@ User request:
         "research_constraints": constraints,
 
         "supervisor_reasoning": reasoning,
+        "supervisor_failed": False,
+        "supervisor_error": "",
 
         "messages": [
             AIMessage(
@@ -752,32 +755,25 @@ def guardrail_blocked_agent(
     }
 
 
+def supervisor_error_agent(state: ResearchState):
+    """Finish the graph after a supervisor routing failure."""
+
+    error_message = state.get(
+        "supervisor_error",
+        "Unable to process your request because the supervisor "
+        "encountered a temporary error. Please try again later.",
+    )
+
+    return {
+        "selected_agents": [],
+        "final_response": error_message,
+        "messages": [AIMessage(content=error_message)],
+    }
+
+
 # =========================================================
 # WEB RESEARCH AGENT
 # =========================================================
-
-def summarize_relevant_content(model, query, content):
-    prompt = f"""
-You are a research assistant.
-
-User query:
-{query}
-
-Webpage content:
-{content}
-
-Extract ONLY the information relevant to the user's query.
-
-Rules:
-- Do not add information not present in the source.
-- Ignore irrelevant content.
-- Preserve important facts, numbers, dates, and names.
-- Keep the extraction focused, but preserve enough detail for a comprehensive report.
-"""
-
-    response = model.invoke(prompt)
-    return response.content
-
 
 
 def web_research_agent(state: ResearchState):
@@ -795,8 +791,6 @@ def web_research_agent(state: ResearchState):
             )
         )
 
-        research_data = []
-
         if isinstance(result, dict):
             answers = result.get("results", [])
         elif isinstance(result, list):
@@ -804,24 +798,7 @@ def web_research_agent(state: ResearchState):
         else:
             answers = []
 
-        for ans in answers:
-            if not isinstance(ans, dict):
-                continue
-
-            content = ans.get("content", "")
-
-            relevant_info = summarize_relevant_content(
-                model,
-                query,
-                content
-            )
-
-            research_data.append({
-                "title": ans.get("title", ""),
-                "url": ans.get("url", ""),
-                "raw_content": ans.get("raw_content", ""),
-                "relevant_info": relevant_info
-            })
+       
 
     except Exception as exc:
         print(
@@ -829,10 +806,10 @@ def web_research_agent(state: ResearchState):
             f"{type(exc).__name__}: {exc}"
         )
 
-        research_data = []
+       
 
     return {
-        "web_results": research_data,
+        "web_results": answers,
 
         "messages": [
             AIMessage(
@@ -884,105 +861,6 @@ def extract_pdf_text(pdf_url: str) -> str:
         return ""
 
 
-def summarize_paper(model, query: str, paper_text: str) -> str:
-
-    prompt = f"""
-You are a research assistant.
-
-Research query:
-{query}
-
-Research paper content:
-{paper_text}
-
-Summarize the research paper specifically according to the
-research query.
-
-Include:
-- Main topic
-- Research problem/objective
-- Important methodology
-- Key findings/results
-- Important numbers, dates, or technical results
-- Main conclusions
-- Limitations if mentioned
-- Relevance to the research query
-
-Rules:
-- Use only information present in the paper content.
-- Do not invent or assume information.
-- Preserve important technical details.
-- Ignore references and unrelated content.
-- Focus only on information relevant to the research query.
-"""
-
-    response = model.invoke(prompt)
-
-    return response.content
-
-
-def summarize_long_paper(
-    model,
-    query: str,
-    paper_text: str
-) -> str:
-
-    MAX_CHARS = 12000
-
-    # Small paper → summarize directly
-    if len(paper_text) <= MAX_CHARS:
-        return summarize_paper(
-            model,
-            query,
-            paper_text
-        )
-
-    # Large paper → split into chunks
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=12000,
-        chunk_overlap=500,
-        separators=[
-            "\n\n",
-            "\n",
-            ". ",
-            " ",
-            ""
-        ]
-    )
-
-    chunks = text_splitter.split_text(paper_text)
-
-    chunk_summaries = []
-
-    for i, chunk in enumerate(chunks, 1):
-
-        print(
-            f"Summarizing paper chunk "
-            f"{i}/{len(chunks)}"
-        )
-
-        summary = summarize_paper(
-            model,
-            query,
-            chunk
-        )
-
-        chunk_summaries.append(summary)
-
-    # Combine chunk summaries
-    combined_summary = "\n\n".join(
-        chunk_summaries
-    )
-
-    # Final summary of all chunk summaries
-    final_summary = summarize_paper(
-        model,
-        query,
-        combined_summary
-    )
-
-    return final_summary
-
 
 def paper_research_agent(state: ResearchState):
 
@@ -991,8 +869,6 @@ def paper_research_agent(state: ResearchState):
     query = state["user_query"]
 
     try:
-
-        # Search research papers
         result = _decode_tool_result(
             run_async(
                 paper_mcp_search(
@@ -1001,19 +877,6 @@ def paper_research_agent(state: ResearchState):
                 )
             )
         )
-
-        # Backend should return a list of dictionaries
-        #
-        # [
-        #   {
-        #       "title": ...,
-        #       "authors": ...,
-        #       "year": ...,
-        #       "paper_url": ...,
-        #       "pdf_url": ...,
-        #       "citation_count": ...
-        #   }
-        # ]
 
         if isinstance(result, dict):
             papers = result.get(
@@ -1027,79 +890,28 @@ def paper_research_agent(state: ResearchState):
 
         paper_results = []
 
+        # Extract text from only one paper URL
         for paper in papers:
 
             if not isinstance(paper, dict):
                 continue
 
-            title = paper.get(
-                "title",
-                "Unknown title"
-            )
+            title = paper.get("title", "Unknown title")
+            authors = paper.get("authors", "")
+            year = paper.get("year", "Unknown year")
+            paper_url = paper.get("paper_url", "")
+            pdf_url = paper.get("pdf_url", "")
+            citation_count = paper.get("citation_count", 0)
 
-            authors = paper.get(
-                "authors",
-                ""
-            )
+            print(f"Processing paper: {title}")
 
-            year = paper.get(
-                "year",
-                "Unknown year"
-            )
-
-            paper_url = paper.get(
-                "paper_url",
-                ""
-            )
-
-            pdf_url = paper.get(
-                "pdf_url",
-                ""
-            )
-
-            citation_count = paper.get(
-                "citation_count",
-                0
-            )
-
-            print(
-                f"Processing paper: {title}"
-            )
-
-            # Download and extract PDF
             paper_text = ""
 
             if pdf_url:
-                paper_text = extract_pdf_text(
-                    pdf_url
-                )
+                paper_text = extract_pdf_text(pdf_url)
 
-            # If PDF extraction fails,
-            # use abstract if available
             if not paper_text:
-
-                abstract = paper.get(
-                    "abstract",
-                    ""
-                )
-
-                if abstract:
-                    paper_text = abstract
-
-                else:
-                    print(
-                        f"Could not extract paper: "
-                        f"{title}"
-                    )
-                    continue
-
-            # Direct summary OR
-            # chunk + summary depending on size
-            summary = summarize_long_paper(
-                model,
-                query,
-                paper_text
-            )
+                paper_text = paper.get("abstract", "")
 
             paper_results.append({
                 "title": title,
@@ -1108,16 +920,18 @@ def paper_research_agent(state: ResearchState):
                 "paper_url": paper_url,
                 "pdf_url": pdf_url,
                 "citation_count": citation_count,
-                "summary": summary
+                "answer": paper_text
             })
+
+            # Stop after processing one paper
+            break
 
         print(
             f"Paper research completed. "
-            f"Processed {len(paper_results)} papers."
+            f"Processed {len(paper_results)} paper."
         )
 
     except Exception as exc:
-
         print(
             f"Paper search failed: "
             f"{type(exc).__name__}: {exc}"
@@ -1127,17 +941,12 @@ def paper_research_agent(state: ResearchState):
 
     return {
         "paper_results": paper_results,
-
         "messages": [
             AIMessage(
                 content="Paper research completed."
             )
         ],
-
-        "llm_calls": (
-            state.get("llm_calls", 0)
-            + len(paper_results)
-        )
+        "llm_calls": state.get("llm_calls", 0)
     }
 
 
@@ -1171,88 +980,16 @@ def extract_article_text(url: str) -> str:
         return ""
     
 
-def summarize_article(model, query, article_text):
-
-    prompt = f"""
-You are a research assistant.
-
-Research query:
-{query}
-
-Article:
-{article_text}
-
-Summarize this article for the research query.
-
-Include:
-- Main topic
-- Important facts
-- Key findings/events
-- Important numbers and dates
-- Relevance to the query
-
-Rules:
-- Use only information from the article.
-- Do not invent facts.
-- Ignore advertisements and unrelated content.
-"""
-
-    response = model.invoke(prompt)
-
-    return response.content
-
-def summarize_long_article(model, query, text):
-
-    MAX_CHARS = 12000
-
-    if len(text) <= MAX_CHARS:
-        return summarize_article(
-            model,
-            query,
-            text
-        )
-
-
-    text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=12000,
-    chunk_overlap=500,
-    separators=["\n\n", "\n", ". ", " ", ""],  # Pehle paragraphs break karo, phir sentences
-)
-
-    chunks = text_splitter.split_text(text)
-
-    summaries = []
-
-    for chunk in chunks:
-        summaries.append(
-            summarize_article(
-                model,
-                query,
-                chunk
-            )
-        )
-
-    combined = "\n\n".join(summaries)
-
-    return summarize_article(
-        model,
-        query,
-        combined
-    )
-
 
     
 
-def news_research_agent(
-    state: ResearchState
-):
-    print("news_research_agent called : ")
+
+def news_research_agent(state: ResearchState):
+    print("news_research_agent called:")
 
     query = state["user_query"]
 
     try:
-
-        # Get news articles from NewsAPI through MCP
         result = _decode_tool_result(
             run_async(
                 news_mcp_search(
@@ -1262,8 +999,6 @@ def news_research_agent(
             )
         )
 
-        # result ko _prompt_text se truncate MAT karo
-        # hume articles ke URLs chahiye
         if isinstance(result, dict):
             articles = result.get("articles", [])
         elif isinstance(result, list):
@@ -1286,23 +1021,13 @@ def news_research_agent(
             if not url:
                 continue
 
-            # 1. Open article URL
+            # Extract original article text
             article_text = extract_article_text(url)
 
             if not article_text:
-                print(
-                    f"Could not extract article: {url}"
-                )
+                print(f"Could not extract article: {url}")
                 continue
 
-            # 2. Send full article to LLM
-            summary = summarize_long_article(
-                model,
-                query,
-                article_text
-            )
-
-            # 3. Store result
             news_results.append({
                 "title": title,
                 "url": url,
@@ -1312,11 +1037,13 @@ def news_research_agent(
                 "published_at": article.get(
                     "publishedAt", ""
                 ),
-                "summary": summary
+                "content": article_text
             })
 
-    except Exception as exc:
+            # Process only one article
+            break
 
+    except Exception as exc:
         print(
             f"News search failed: "
             f"{type(exc).__name__}: {exc}"
@@ -1325,118 +1052,16 @@ def news_research_agent(
         news_results = []
 
     return {
-
         "news_results": news_results,
-
         "messages": [
             AIMessage(
                 content="News research completed."
             )
         ],
-
-        "llm_calls":
-            state.get("llm_calls", 0)
-            + len(news_results),
+        "llm_calls": state.get("llm_calls", 0)
     }
 
 
-def summarize_youtube(model, query: str, transcript: str) -> str:
-
-    prompt = f"""
-You are a research assistant.
-
-Research query:
-{query}
-
-YouTube video transcript:
-{transcript}
-
-Summarize this transcript specifically according
-to the research query.
-
-Include:
-- Main topic
-- Important concepts
-- Key points
-- Important facts, numbers, or examples
-- Main conclusions
-- Relevance to the research query
-
-Rules:
-- Use only information from the transcript.
-- Do not invent information.
-- Focus only on information relevant to the query.
-- Preserve important technical details.
-"""
-
-    response = model.invoke(prompt)
-
-    return response.content
-
-
-def summarize_long_youtube(
-    model,
-    query: str,
-    transcript: str
-) -> str:
-
-    MAX_CHARS = 12000
-
-    # Small transcript → direct summary
-    if len(transcript) <= MAX_CHARS:
-        return summarize_youtube(
-            model,
-            query,
-            transcript
-        )
-
-    # Large transcript → chunks
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=12000,
-        chunk_overlap=500,
-        separators=[
-            "\n\n",
-            "\n",
-            ". ",
-            " ",
-            ""
-        ]
-    )
-
-    chunks = text_splitter.split_text(
-        transcript
-    )
-
-    chunk_summaries = []
-
-    for i, chunk in enumerate(chunks, 1):
-
-        print(
-            f"Summarizing YouTube transcript "
-            f"chunk {i}/{len(chunks)}"
-        )
-
-        summary = summarize_youtube(
-            model,
-            query,
-            chunk
-        )
-
-        chunk_summaries.append(summary)
-
-    # Combine chunk summaries
-    combined_summary = "\n\n".join(
-        chunk_summaries
-    )
-
-    # Final summary
-    final_summary = summarize_youtube(
-        model,
-        query,
-        combined_summary
-    )
-
-    return final_summary
 
 
 
@@ -1447,13 +1072,11 @@ def youtube_research_agent(state: ResearchState):
     query = state["user_query"]
 
     try:
-
-        # YouTube search + transcript
         result = _decode_tool_result(
             run_async(
                 youtube_mcp_search(
                     query,
-                    limit=3
+                    limit=1
                 )
             )
         )
@@ -1471,54 +1094,28 @@ def youtube_research_agent(state: ResearchState):
             if not video.get("title") and not video.get("url"):
                 continue
 
-            title = video.get(
-                "title",
-                ""
-            )
+            title = video.get("title", "")
+            channel = video.get("channel", "")
+            video_url = video.get("url", "")
+            transcript = video.get("transcript", "")
 
-            channel = video.get(
-                "channel",
-                ""
-            )
+            print(f"Processing YouTube video: {title}")
 
-            video_url = video.get(
-                "url",
-                ""
-            )
-
-            transcript = video.get(
-                "transcript",
-                ""
-            )
-
-            print(
-                f"Processing YouTube video: {title}"
-            )
-
-            # No transcript → skip
             if not transcript:
-                print(
-                    f"Transcript unavailable: {title}"
-                )
+                print(f"Transcript unavailable: {title}")
                 continue
-
-            # Small transcript → direct summary
-            # Large transcript → chunks → summaries → final summary
-            summary = summarize_long_youtube(
-                model,
-                query,
-                transcript
-            )
 
             youtube_results.append({
                 "title": title,
                 "channel": channel,
                 "video_url": video_url,
-                "summary": summary
+                "transcript": transcript
             })
 
-    except Exception as exc:
+            # Process only one video
+            break
 
+    except Exception as exc:
         print(
             f"YouTube research failed: "
             f"{type(exc).__name__}: {exc}"
@@ -1528,17 +1125,12 @@ def youtube_research_agent(state: ResearchState):
 
     return {
         "youtube_results": youtube_results,
-
         "messages": [
             AIMessage(
                 content="YouTube research completed."
             )
         ],
-
-        "llm_calls": (
-            state.get("llm_calls", 0)
-            + len(youtube_results)
-        )
+        "llm_calls": state.get("llm_calls", 0)
     }
 
 
@@ -1562,120 +1154,207 @@ def research_complete_agent(state: ResearchState):
 
 
 
-
 # =========================================================
 # ANALYSIS AGENT
 # =========================================================
-def analysis_agent(
-    state: ResearchState
-):
 
-    prompt = f"""
-Analyze the research collected from multiple sources and
-create a clear final research response.
+def final_agent(state: ResearchState):
 
-USER QUESTION:
-{state["user_query"]}
+    print("research analysis agent called")
 
-WEB SOURCES:
-{_prompt_text(
-    state.get("web_results", ""),
-    10000
-)}
+    query = state["user_query"]
 
-ACADEMIC PAPERS:
-{_prompt_text(
-    state.get("paper_results", ""),
-    10000
-)}
+    # Collect research from all agents
+    research_data = {
+        "web_sources": state.get("web_results", []),
+        "academic_papers": state.get("paper_results", []),
+        "news_sources": state.get("news_results", []),
+        "youtube_videos": state.get("youtube_results", [])
+    }
 
-NEWS SOURCES:
-{_prompt_text(
-    state.get("news_results", ""),
-    10000
-)}
+    # Convert research data into text
+    context = json.dumps(
+        research_data,
+        ensure_ascii=False,
+        indent=2,
+        default=str
+    )
 
-YOUTUBE VIDEOS:
-{_prompt_text(
-    state.get("youtube_results", ""),
-    10000
-)}
+    # Context thresholds (characters)
+    MAX_CONTEXT_LENGTH = 20000
+    CHUNK_SIZE = 12000
 
-First analyze the research:
-
-1. Identify the most relevant information.
-2. Extract important findings.
-3. Compare information from different sources.
-4. Identify agreements or contradictions.
-5. Do not invent facts.
-6. Preserve source names and URLs.
-7. Clearly distinguish supported information from
-   information that is unavailable.
-
-Then create the final research response with these sections:
-
-1. Research Summary
-
-2. Key Findings
-
-3. Detailed Analysis
-
-4. Academic Research
-
-5. Recent News / Reports
-
-6. Sources
-
-The Research Summary must be substantial: write 4–6 well-developed
-paragraphs. Explain the main concepts, the major perspectives or theories,
-the strongest evidence from the collected sources, areas of agreement or
-disagreement, practical implications, and a balanced conclusion. Do not
-reduce the summary to a few generic sentences.
-
-For every important source include:
-
-- Source name
-- Title
-- Short useful summary
-- Original URL
-
-IMPORTANT:
-
-- Do not invent sources.
-- Do not invent URLs.
-- Use only information provided by the research agents.
-- Preserve original source links.
-- Clearly mention when information is unavailable.
-- Keep the answer readable.
-
-The numbered analysis steps and IMPORTANT rules are internal instructions.
-Do not include them in your response and do not state that you followed them.
-Return only the requested research report.
-"""
+    llm_calls = 0
 
     try:
 
-        print(
-            "research analysis + called:"
-        )
+        print(f"Research context length: {len(context)}")
 
-        response = model.invoke(
-            [
-                SystemMessage(
-                    content=(
-                        "You are a professional AI "
-                        "research analysis and report "
-                        "generation assistant. Return only the research "
-                        "report, not your internal analysis or rules."
-                    )
-                ),
-                HumanMessage(
-                    content=prompt
-                ),
-            ]
-        )
+        system_prompt = """
+        You are a professional AI research analysis
+        and report generation assistant.
 
-        result = response.content
+        Use only the information provided by the research agents.
+        Do not invent facts, sources, or URLs.
+        Preserve original source names, titles, and URLs.
+        Clearly mention when information is unavailable.
+
+        Return the final report using these sections:
+
+        1. Research Summary
+        2. Key Findings
+        3. Detailed Analysis
+        4. Academic Research
+        5. Recent News / Reports
+        6. Sources
+
+        The Research Summary should contain 4-6 well-developed
+        paragraphs explaining the main concepts, key evidence,
+        different perspectives, agreements or contradictions,
+        practical implications, and a balanced conclusion.
+
+        For important sources, include the source name,
+        title, useful summary, and original URL.
+
+        Return only the research report.
+        """
+
+        # -------------------------------------------------
+        # CASE 1: SMALL CONTEXT - DIRECT REPORT GENERATION
+        # -------------------------------------------------
+        if len(context) <= MAX_CONTEXT_LENGTH:
+
+            print("Context is small. Generating report directly.")
+
+            prompt = f"""
+            USER QUESTION:
+            {query}
+
+            RESEARCH DATA:
+            {context}
+
+            Analyze the collected research and generate
+            the complete final research report.
+            """
+
+            response = model.invoke([
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=prompt)
+            ])
+
+            result = response.content
+            llm_calls += 1
+
+        # -------------------------------------------------
+        # CASE 2: LARGE CONTEXT - CHUNK + SUMMARIZE
+        # -------------------------------------------------
+        else:
+
+            print("Context is large. Dividing into chunks.")
+
+            chunks = []
+            remaining = context
+
+            # Split at newline boundaries when possible
+            while remaining:
+
+                if len(remaining) <= CHUNK_SIZE:
+                    chunks.append(remaining)
+                    break
+
+                split_at = remaining.rfind(
+                    "\n", 0, CHUNK_SIZE
+                )
+
+                # Avoid creating an excessively small chunk
+                if split_at < CHUNK_SIZE // 2:
+                    split_at = CHUNK_SIZE
+
+                chunks.append(remaining[:split_at])
+                remaining = remaining[split_at:].lstrip("\n")
+
+            print(f"Total chunks: {len(chunks)}")
+
+            chunk_summaries = []
+
+            # Generate a summary for each chunk
+            for index, chunk in enumerate(chunks, start=1):
+
+                print(
+                    f"Summarizing chunk {index}/{len(chunks)}"
+                )
+
+                chunk_prompt = f"""
+                USER QUESTION:
+                {query}
+
+                RESEARCH CONTEXT - CHUNK {index}/{len(chunks)}:
+                {chunk}
+
+                Summarize the useful research information
+                relevant to the user's question.
+
+                Requirements:
+                - Preserve important facts and findings.
+                - Preserve source names, titles and original URLs.
+                - Include relevant academic, news and video details.
+                - Mention disagreements or limitations when present.
+                - Do not invent facts or sources.
+                - Do not generate the final report yet.
+                """
+
+                response = model.invoke([
+                    SystemMessage(
+                        content=(
+                            "You are a research summarization "
+                            "assistant. Summarize the provided "
+                            "chunk accurately and preserve source links."
+                        )
+                    ),
+                    HumanMessage(content=chunk_prompt)
+                ])
+
+                chunk_summaries.append(response.content)
+                llm_calls += 1
+
+            # Generate the final report from all chunk summaries
+            print("Generating final report from chunk summaries.")
+
+            combined_summaries = "\n\n".join(
+                f"CHUNK SUMMARY {index}:\n{summary}"
+                for index, summary in enumerate(
+                    chunk_summaries, start=1
+                )
+            )
+
+            final_prompt = f"""
+            USER QUESTION:
+            {query}
+
+            SUMMARIES OF THE COLLECTED RESEARCH:
+            {combined_summaries}
+
+            Using all the summaries, synthesize a complete
+            and coherent final research report.
+
+            Requirements:
+            - Combine overlapping findings without repetition.
+            - Compare perspectives and identify contradictions.
+            - Preserve original source names, titles and URLs.
+            - Do not invent facts or missing source details.
+            - Clearly identify unavailable information.
+            - Follow all six sections specified in the system prompt.
+            - Write a substantial Research Summary of 4-6 paragraphs.
+            - Return only the final research report.
+            """
+
+            response = model.invoke([
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=final_prompt)
+            ])
+
+            result = response.content
+            llm_calls += 1
 
     except Exception as exc:
 
@@ -1685,27 +1364,227 @@ Return only the requested research report.
         )
 
         result = (
-            "Research analysis and report "
-            "generation unavailable."
+            "Research analysis and report generation unavailable."
+        )
+
+    return {
+        "draft_report": result,
+        "final_response": result,
+        "messages": [
+            AIMessage(
+                content="Research analysis and report completed."
+            )
+        ],
+        "llm_calls": llm_calls
+    }
+
+
+
+
+# =========================================================
+# HUMAN-IN-THE-LOOP (DISABLED)
+# =========================================================
+# The approval/revision agent and feedback evaluation flow are intentionally
+# disabled. Reports are now finalized automatically after analysis. The
+# legacy evaluator below is retained only as reference and is not registered
+# in the graph.
+
+def feedback_evaluation_agent(
+    state: ResearchState
+):
+    """
+    Check whether the user's feedback can be
+    satisfied using the information we already have.
+
+    If information exists:
+        no new research
+
+    If information is missing:
+        create a focused research query
+    """
+
+    feedback = state.get(
+        "human_feedback",
+        ""
+    ).strip()
+
+    draft = state.get(
+        "draft_report",
+        ""
+    )
+
+    web_results = state.get(
+        "web_results",
+        ""
+    )
+
+    paper_results = state.get(
+        "paper_results",
+        ""
+    )
+
+    news_results = state.get(
+        "news_results",
+        ""
+    )
+
+    youtube_results = state.get(
+        "youtube_results",
+        ""
+    )
+
+    prompt = f"""
+You are a feedback evaluation agent.
+
+The user rejected the research report and gave feedback.
+
+ORIGINAL USER QUERY:
+{state.get("user_query", "")}
+
+USER FEEDBACK:
+{feedback}
+
+CURRENT DRAFT REPORT:
+{_prompt_text(draft)}
+
+EXISTING WEB RESEARCH:
+{_prompt_text(web_results)}
+
+EXISTING PAPER RESEARCH:
+{_prompt_text(paper_results)}
+
+EXISTING NEWS RESEARCH:
+{_prompt_text(news_results)}
+
+EXISTING YOUTUBE RESEARCH:
+{_prompt_text(youtube_results)}
+
+Your job is to determine whether the user's feedback
+can be satisfied using the information that is ALREADY
+present in the existing research.
+
+Return ONLY valid JSON:
+
+{{
+    "needs_research": true,
+    "research_query": "...",
+    "reason": "..."
+}}
+
+Rules:
+
+1. needs_research = false when the existing research
+   already contains enough information to satisfy the
+   user's feedback.
+
+Examples:
+- Change formatting
+- Make the answer shorter
+- Explain an existing point in more detail
+- Reorganize sections
+- Add information that already exists in the research
+
+2. needs_research = true when the user is asking for
+   factual information, evidence, sources, dates,
+   comparisons, statistics, examples, or details that
+   are NOT available in the existing research.
+
+3. If needs_research is true, create a focused
+   standalone research query based specifically on
+   the user's feedback.
+
+4. Do not create a generic query.
+
+5. Do not assume missing information exists.
+
+6. Do not perform research yourself.
+
+Return ONLY JSON.
+"""
+
+    try:
+
+        response = model.invoke(
+            [
+                SystemMessage(
+                    content=(
+                        "You are a research "
+                        "feedback evaluator. "
+                        "Return only valid JSON."
+                    )
+                ),
+                HumanMessage(
+                    content=prompt
+                )
+            ]
+        )
+
+        raw = response.content.strip()
+
+        # Remove markdown fences if model adds them
+        raw = raw.replace(
+            "```json",
+            ""
+        ).replace(
+            "```",
+            ""
+        ).strip()
+
+        decision = json.loads(raw)
+
+        needs_research = bool(
+            decision.get(
+                "needs_research",
+                False
+            )
+        )
+
+        research_query = str(
+            decision.get(
+                "research_query",
+                ""
+            )
+        ).strip()
+
+        reason = str(
+            decision.get(
+                "reason",
+                ""
+            )
+        ).strip()
+
+    except Exception as exc:
+
+        print(
+            "Feedback evaluation failed:",
+            exc
+        )
+
+        # Conservative fallback:
+        # use existing research instead of
+        # unnecessarily performing another search.
+        needs_research = False
+        research_query = ""
+        reason = (
+            "Existing research will be reused "
+            "because feedback evaluation failed."
         )
 
     return {
 
-        "analysis_results": result,
+        "revision_requires_research":
+            needs_research,
 
-        "draft_report": result,
+        "revision_query":
+            research_query,
 
-        "approval_request": (
-            "Please review the generated "
-            "research report. Approve it or "
-            "provide revision feedback."
-        ),
+        "revision_reason":
+            reason,
 
         "messages": [
             AIMessage(
                 content=(
-                    "Research analysis and "
-                    "report completed."
+                    "Feedback evaluation completed."
                 )
             )
         ],
@@ -1713,188 +1592,7 @@ Return only the requested research report.
         "llm_calls": 1,
     }
 
-# =========================================================
-# HUMAN APPROVAL
-# =========================================================
 
-def human_approval_agent(
-    state: ResearchState
-):
-
-
-    review = interrupt(
-        {
-            "question":
-                "Do you approve this research report?",
-
-            "draft_report":
-                state.get(
-                    "draft_report",
-                    ""
-                ),
-
-            "approval_request":
-                state.get(
-                    "approval_request",
-                    ""
-                ),
-
-            "selected_agents":
-                state.get(
-                    "selected_agents",
-                    []
-                ),
-
-            "supervisor_reasoning":
-                state.get(
-                    "supervisor_reasoning",
-                    ""
-                ),
-
-            "expected_response": {
-                "approved": True,
-                "feedback":
-                    "Optional revision feedback",
-            },
-        }
-    )
-
-    approved = bool(
-        review.get(
-            "approved",
-            False
-        )
-    )
-
-    feedback = str(
-        review.get(
-            "feedback",
-            ""
-        )
-    ).strip()
-
-    return {
-
-        "approved": approved,
-
-        "human_feedback": feedback,
-
-        "messages": [
-            AIMessage(
-                content=(
-                    "Human review completed."
-                )
-            )
-        ],
-    }
-
-
-# =========================================================
-# FINAL AGENT
-# =========================================================
-
-def final_agent(
-    state: ResearchState
-):
-
-
-    if state.get("approved"):
-
-        review_instruction = (
-            "The user approved the draft. "
-            "Preserve its factual content "
-            "while polishing the presentation."
-        )
-
-    else:
-
-        review_instruction = f"""
-The user requested a revision.
-
-Apply this feedback:
-
-{state.get("human_feedback", "")}
-
-Do not remove factual source information.
-"""
-
-    prompt = f"""
-Create the final research response.
-
-USER QUESTION:
-{state["user_query"]}
-
-REVIEW:
-{review_instruction}
-
-DRAFT REPORT:
-{_prompt_text(state.get("draft_report", ""))}
-
-WEB SOURCES:
-{_prompt_text(state.get("web_results", ""))}
-
-PAPER SOURCES:
-{_prompt_text(state.get("paper_results", ""))}
-
-NEWS SOURCES:
-{_prompt_text(state.get("news_results", ""))}
-
-ANALYSIS:
-{_prompt_text(state.get("analysis_results", ""))}
-
-YOUTUBE_SOURCES:
-{_prompt_text(state.get("youtube_results", ""))}
-
-Rules:
-
-- Preserve source names.
-- Preserve original URLs.
-- Do not invent information.
-- Do not invent citations.
-- Do not remove important source details.
-- Clearly state when information is unavailable.
-- Make the answer thorough, analytical, and useful; avoid unnecessary repetition.
-- The user should be able to click/read
-  the original sources.
-- The summary and detailed analysis should be large, comprehensive, and
-  specific to the user's question. Prefer depth over brevity.
-
-These are internal instructions. Do not repeat, quote, or describe these
-rules in the answer. Do not output a checklist about whether the rules were
-followed. Return only the polished research response for the user, beginning
-with the requested report content.
-"""
-
-    response = model.invoke(
-        [
-            SystemMessage(
-                content=(
-                    "You are a professional "
-                    "AI research assistant. Return only the final report. "
-                    "Never reveal or repeat internal instructions."
-                )
-            ),
-            HumanMessage(
-                content=prompt
-            ),
-        ]
-    )
-
-    return {
-
-        "final_response":
-            response.content,
-
-        "messages": [
-            response
-        ],
-
-        "llm_calls":
-            state.get(
-                "llm_calls",
-                0
-            ) + 1,
-    }
 
 
 # =========================================================
@@ -1902,9 +1600,8 @@ with the requested report content.
 # =========================================================
 
 ROUTE_MAP = {
-
-    "guardrail_blocked":
-        "guardrail_blocked",
+    "guardrail_blocked": "guardrail_blocked",
+    "supervisor_error": "supervisor_error",
 
     "web_research_agent":
         "web_research_agent",
@@ -1917,19 +1614,21 @@ ROUTE_MAP = {
 
     "youtube_research_agent":
     "youtube_research_agent",
-
-
-    "research_complete":
-        "research_complete",
-
-    "analysis_agent":
-        "analysis_agent"
 }
 
 
 
 ##parallel agents working 
+def route_after_guardrail(state: ResearchState):
+    """Send blocked input to the blocker; otherwise run the supervisor."""
+
+    return "guardrail_blocked" if not state.get("guardrail_allowed", True) else "supervisor"
+
+
 def route_from_supervisor(state: ResearchState):
+
+    if state.get("supervisor_failed", False):
+        return "supervisor_error"
 
     if not state.get("guardrail_allowed", True):
         return "guardrail_blocked"
@@ -1964,13 +1663,16 @@ def route_from_supervisor(state: ResearchState):
     ]
 
 
-
 # =========================================================
 # BUILD GRAPH
 # =========================================================
 
 graph = StateGraph(
     ResearchState
+)
+graph.add_node(
+    "guardrail_agent",
+    guardrail_agent
 )
 
 
@@ -1982,6 +1684,11 @@ graph.add_node(
 graph.add_node(
     "guardrail_blocked",
     guardrail_blocked_agent
+)
+
+graph.add_node(
+    "supervisor_error",
+    supervisor_error_agent
 )
 
 graph.add_node(
@@ -2009,10 +1716,9 @@ graph.add_node(
     research_complete_agent
 )
 
-
 graph.add_node(
-    "analysis_agent",
-    analysis_agent
+    "final_agent",
+    final_agent
 )
 
 # graph.add_node(
@@ -2020,27 +1726,29 @@ graph.add_node(
 #     report_agent
 # )
 
-graph.add_node(
-    "human_approval",
-    human_approval_agent
-)
 
-graph.add_node(
-    "final_agent",
-    final_agent
-)
 
 
 graph.add_edge(
     START,
-    "supervisor"
+    "guardrail_agent"
+)
+
+
+graph.add_conditional_edges(
+    "guardrail_agent",
+    route_after_guardrail,
+    {
+        "guardrail_blocked": "guardrail_blocked",
+        "supervisor": "supervisor",
+    },
 )
 
 
 graph.add_conditional_edges(
     "supervisor",
     route_from_supervisor,
-    ROUTE_MAP
+    ROUTE_MAP,
 )
 
 
@@ -2070,26 +1778,8 @@ graph.add_edge(
 
 graph.add_edge(
     "research_complete",
-    "analysis_agent"
-)
-
-graph.add_edge(
-    "analysis_agent",
-    "human_approval"
-)
-
-
-# graph.add_edge(
-#     "report_agent",
-#     "human_approval"
-# )
-
-
-graph.add_edge(
-    "human_approval",
     "final_agent"
 )
-
 
 graph.add_edge(
     "final_agent",
@@ -2102,13 +1792,17 @@ graph.add_edge(
     END
 )
 
+graph.add_edge(
+    "supervisor_error",
+    END
+)
+
 
 # =========================================================
 # MONGODB CHECKPOINTER
 # =========================================================
 
 research_graph = None
-memory_checkpointer = MemorySaver()
 
 
 def get_research_graph():
@@ -2117,90 +1811,9 @@ def get_research_graph():
 
     if research_graph is None:
 
-        try:
-
-            mongodb_uri = get_database_url()
-
-            mongodb_client = MongoClient(
-                mongodb_uri,
-                connect=False,
-                serverSelectionTimeoutMS=int(
-                    os.getenv(
-                        "MONGODB_SERVER_SELECTION_TIMEOUT_MS",
-                        "5000"
-                    )
-                ),
-            )
-
-            checkpointer = MongoDBSaver(
-                client=mongodb_client,
-                db_name=os.getenv(
-                    "MONGODB_DB_NAME",
-                    "research_agent_db"
-                ),
-            )
-
-            research_graph = graph.compile(
-                checkpointer=checkpointer
-            )
-
-        except PyMongoError as error:
-
-            if (
-                os.getenv(
-                    "MONGODB_REQUIRED",
-                    "false"
-                ).lower()
-                == "true"
-            ):
-
-                raise RuntimeError(
-                    "MongoDB connection failed."
-                ) from error
-
-            print(
-                "MongoDB unavailable. "
-                "Using in-memory graph."
-            )
-
-            # A checkpointer is still required for interrupt/resume even
-            # when MongoDB is unavailable.
-            research_graph = graph.compile(
-                checkpointer=memory_checkpointer
-            )
+        research_graph = graph.compile()
 
     return research_graph
-
-
-# =========================================================
-# INTERRUPT SERIALIZATION
-# =========================================================
-
-def _interrupt_payload(
-    result: dict[str, Any]
-):
-
-    interrupts = result.get(
-        "__interrupt__",
-        []
-    )
-
-    if not interrupts:
-        return None
-
-    first = interrupts[0]
-
-    payload = getattr(
-        first,
-        "value",
-        first
-    )
-
-    return (
-        payload
-        if isinstance(payload, dict)
-        else {"value": payload}
-    )
 
 
 # =========================================================
@@ -2209,7 +1822,6 @@ def _interrupt_payload(
 
 def _serialize_result(
     result: dict[str, Any],
-    thread_id: str,
 ):
 
     messages = result.get(
@@ -2228,44 +1840,10 @@ def _serialize_result(
         or last_message
     )
 
-    interrupt_payload = (
-        _interrupt_payload(result)
-    )
-
-    if interrupt_payload:
-
-        answer = (
-            interrupt_payload.get(
-                "draft_report"
-            )
-            or result.get(
-                "draft_report",
-                ""
-            )
-        )
-
     return {
-
-        "thread_id":
-            thread_id,
 
         "answer":
             answer,
-
-        "requires_approval":
-            interrupt_payload is not None,
-
-        "approval_request": (
-            interrupt_payload.get(
-                "approval_request",
-                ""
-            )
-            if interrupt_payload
-            else result.get(
-                "approval_request",
-                ""
-            )
-        ),
 
         "web_results":
             result.get(
@@ -2285,23 +1863,11 @@ def _serialize_result(
                 ""
             ),
 
-        "analysis_results":
-            result.get(
-                "analysis_results",
-                ""
-            ),
+        "draft_report": result.get("draft_report", ""),
 
-        "draft_report": (
-            interrupt_payload.get(
-                "draft_report",
-                ""
-            )
-            if interrupt_payload
-            else result.get(
-                "draft_report",
-                ""
-            )
-        ),
+        "analysis_route": result.get("analysis_route", ""),
+
+        "context_token_estimate": result.get("context_token_estimate", 0),
 
         "selected_agents":
             result.get(
@@ -2321,6 +1887,12 @@ def _serialize_result(
                 ""
             ),
 
+        "supervisor_error":
+            result.get(
+                "supervisor_error",
+                ""
+            ),
+
         "guardrail_allowed":
             result.get(
                 "guardrail_allowed",
@@ -2330,17 +1902,6 @@ def _serialize_result(
         "guardrail_reason":
             result.get(
                 "guardrail_reason",
-                ""
-            ),
-
-        "approved":
-            result.get(
-                "approved"
-            ),
-
-        "human_feedback":
-            result.get(
-                "human_feedback",
                 ""
             ),
 
@@ -2357,21 +1918,8 @@ def _serialize_result(
 # =========================================================
 
 def run_research_agent(
-    user_input: str,
-    thread_id: str | None = None
+    user_input: str
 ):
-
-    if not thread_id:
-
-        thread_id = (
-            f"user_{uuid.uuid4().hex}"
-        )
-
-    config = {
-        "configurable": {
-            "thread_id": thread_id
-        }
-    }
 
     research_graph = (
         get_research_graph()
@@ -2404,6 +1952,12 @@ def run_research_agent(
             "supervisor_reasoning":
                 "",
 
+            "supervisor_failed":
+                False,
+
+            "supervisor_error":
+                "",
+
             "web_results":
                 "",
 
@@ -2415,20 +1969,20 @@ def run_research_agent(
             
             "youtube_results": "",
 
-            "analysis_results":
-                "",
-
             "draft_report":
                 "",
 
-            "approval_request":
+            "combined_research_context":
                 "",
 
-            "approved":
-                False,
-
-            "human_feedback":
+            "analysis_context":
                 "",
+
+            "analysis_route":
+                "",
+
+            "context_token_estimate":
+                0,
 
             "final_response":
                 "",
@@ -2437,63 +1991,8 @@ def run_research_agent(
                 0,
         },
 
-        config=config,
     )
 
     return _serialize_result(
-        result,
-        thread_id
-    )
-
-
-# =========================================================
-# FASTAPI - RESUME AFTER HITL
-# =========================================================
-
-def resume_research_agent(
-    thread_id: str,
-    approved: bool,
-    feedback: str = "",
-):
-
-    if not thread_id:
-
-        raise ValueError(
-            "thread_id is required."
-        )
-
-    config = {
-        "configurable": {
-            "thread_id": thread_id
-        }
-    }
-
-    research_graph = (
-        get_research_graph()
-    )
-
-    checkpoint = research_graph.get_state(config)
-
-    if not checkpoint or "user_query" not in checkpoint.values:
-        raise ValueError(
-            "Research thread was not found or has expired. "
-            "Start a new research request before approving."
-        )
-
-    result = research_graph.invoke(
-        Command(
-            resume={
-                "approved":
-                    approved,
-
-                "feedback":
-                    feedback.strip(),
-            }
-        ),
-        config=config,
-    )
-
-    return _serialize_result(
-        result,
-        thread_id
+        result
     )

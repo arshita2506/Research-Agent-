@@ -1,21 +1,29 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 
-import traceback
+import asyncio
+import json
 import os
+import secrets
+import traceback
+from datetime import datetime, timedelta, timezone
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
+import random 
+from pymongo import MongoClient
 import uvicorn
 import nest_asyncio
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 if __package__:
     # Project-root execution: uvicorn backend.app:app
-    from .main import run_research_agent, resume_research_agent
+    from .main import run_research_agent
 else:
     # Render/direct execution from the backend directory: uvicorn app:app
-    from main import run_research_agent, resume_research_agent
+    from main import run_research_agent
 
 
 load_dotenv()
@@ -26,6 +34,13 @@ nest_asyncio.apply()
 app = FastAPI()
 
 
+MONGO_URI = os.getenv("MONGO_URI")
+
+client = MongoClient(MONGO_URI)
+db = client["research"]
+
+history = db["History"]
+
 
 # --------------------------------------------------
 # CORS
@@ -35,11 +50,11 @@ frontend_origins = [
     origin.strip().rstrip("/")
     for origin in os.getenv(
         "FRONTEND_ORIGINS",
-        (
-            "http://localhost:3000,"
+        # NOTE: put your original default value here.
+       "http://localhost:3000,"
             "http://127.0.0.1:3000,"
             "https://research-drab-omega.vercel.app"
-        ),
+
     ).split(",")
     if origin.strip()
 ]
@@ -58,149 +73,67 @@ app.add_middleware(
 )
 
 
+
+
 # --------------------------------------------------
 # Request Models
 # --------------------------------------------------
 
 class ResearchRequest(BaseModel):
     message: str
-    thread_id: str | None = None
-
-
-class ApprovalRequest(BaseModel):
-    thread_id: str = Field(min_length=1)
-    approved: bool
-    feedback: str = ""
+   
 
 
 # --------------------------------------------------
 # Research API
 # --------------------------------------------------
 
+
+
+from datetime import datetime, timezone, timedelta
+from fastapi.responses import JSONResponse
+
 @app.post("/api/research")
 def research_agent(request_data: ResearchRequest):
 
-    try:
+   
+    user_message = request_data.message.strip()
 
-        print("1. Research request received")
-
-        user_message = request_data.message.strip()
-
-        if not user_message:
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "success": False,
-                    "error": "Message cannot be empty."
-                }
-            )
-
-        print("2. User query:", user_message)
-
-        thread_id = request_data.thread_id
-
-        if thread_id is None:
-            print("No thread_id provided. New research thread will be created.")
-        else:
-            print("Existing thread_id:", thread_id)
-
-        result = run_research_agent(
-            user_input=user_message,
-            thread_id=thread_id
+    if not user_message:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "error": "Message cannot be empty."
+            }
         )
 
-        print("3. Research completed")
+    # Check daily limit
+  
+
+
+
+    try:
+        result = run_research_agent(
+            user_input=user_message
+        )
 
         return JSONResponse(
             content={
                 "success": True,
                 **result,
+                "usage": None
             }
         )
 
     except Exception as e:
 
-        print("RESEARCH ERROR:", e)
-        traceback.print_exc()
-
         return JSONResponse(
             status_code=500,
             content={
                 "success": False,
-                "error": str(e)
+                "error": "Research failed."
             }
-        )
-
-
-# --------------------------------------------------
-# Human Approval / Revision
-# --------------------------------------------------
-
-@app.post("/api/research/approve")
-async def approve_research(request_data: ApprovalRequest):
-
-    try:
-
-        # If user rejects the report,
-        # feedback is required.
-
-        if (
-            not request_data.approved
-            and not request_data.feedback.strip()
-        ):
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "success": False,
-                    "error": (
-                        "Please provide revision feedback "
-                        "when rejecting the research report."
-                    ),
-                },
-            )
-
-        print("Approval received")
-        print("Thread ID:", request_data.thread_id)
-        print("Approved:", request_data.approved)
-
-        # ------------------------------------------
-        # Resume LangGraph
-        # ------------------------------------------
-
-        result = resume_research_agent(
-            thread_id=request_data.thread_id,
-            approved=request_data.approved,
-            feedback=request_data.feedback,
-        )
-
-        return JSONResponse(
-            content={
-                "success": True,
-                **result,
-            }
-        )
-
-    except ValueError as exc:
-
-        return JSONResponse(
-            status_code=400,
-            content={
-                "success": False,
-                "error": str(exc),
-            },
-        )
-
-    except Exception as exc:
-
-        print("APPROVAL ERROR:", exc)
-        traceback.print_exc()
-
-        return JSONResponse(
-            status_code=500,
-            content={
-                "success": False,
-                "error": str(exc),
-            },
         )
 
 

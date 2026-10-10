@@ -34,7 +34,7 @@ except ImportError:
 # --------------------------------------------------
 
 @mcp.tool()
-def web_search(query: str, max_results: int = 10):
+def web_search(query: str, max_results: int = 1):
 
     if not TAVILY_API_KEY:
         return {
@@ -83,7 +83,7 @@ def web_search(query: str, max_results: int = 10):
 
 @mcp.tool()
 
-def paper_search(query: str, limit: int = 3):
+def paper_search(query: str, limit: int = 1):
 
     url = "https://api.openalex.org/works"
 
@@ -187,7 +187,7 @@ def paper_search(query: str, limit: int = 3):
 # --------------------------------------------------
 
 @mcp.tool()
-def news_search(query: str, limit: int = 3):
+def news_search(query: str, limit: int = 1):
 
 
     if not NEWS_API_KEY:
@@ -278,7 +278,7 @@ def news_search(query: str, limit: int = 3):
 
 
 @mcp.tool()
-def youtube_search(query: str, limit: int = 3):
+def youtube_search(query: str, limit: int = 1):
 
     # 1. Search YouTube
     url = "https://www.googleapis.com/youtube/v3/search"
