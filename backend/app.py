@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 import random 
+import logging
 from pymongo import MongoClient
 import uvicorn
 import nest_asyncio
@@ -29,6 +30,8 @@ else:
 load_dotenv()
 
 nest_asyncio.apply()
+
+logger = logging.getLogger(__name__)
 
 
 app = FastAPI()
@@ -128,11 +131,20 @@ def research_agent(request_data: ResearchRequest):
 
     except Exception as e:
 
+        # Keep the client response generic, but never hide the real server
+        # error. Without this traceback a 500 from the research graph cannot
+        # be diagnosed from the Uvicorn log.
+        logger.exception("Research request failed")
+
         return JSONResponse(
             status_code=500,
             content={
                 "success": False,
-                "error": "Research failed."
+                "error": (
+                    str(e)
+                    if os.getenv("DEBUG", "").strip().lower() in {"1", "true", "yes"}
+                    else "Research failed."
+                )
             }
         )
 

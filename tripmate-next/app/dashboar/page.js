@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { marked } from "marked";
 
 const configuredApiUrl = process.env.NEXT_PUBLIC_API_URL;
@@ -15,6 +15,15 @@ const QUICK_PROMPTS = [
   "Latest research on Large Language Models",
   "How does Retrieval Augmented Generation work?",
 ];
+const RESEARCH_STATE_KEY = "tripmate-research-state";
+
+// Wrap every table in a scroll container so wide tables never break the layout
+function renderMarkdown(text) {
+  return marked
+    .parse(text)
+    .replace(/<table>/g, '<div class="table-wrap"><table>')
+    .replace(/<\/table>/g, "</table></div>");
+}
 
 export default function Home() {
   const [input, setInput] = useState("");
@@ -22,42 +31,65 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
+  // Restore the last query/report when returning from a source link or after
+  // a browser refresh. sessionStorage is temporary and scoped to this tab.
+  useEffect(() => {
+    try {
+      const saved = sessionStorage.getItem(RESEARCH_STATE_KEY);
+      if (!saved) return;
+
+      const state = JSON.parse(saved);
+      if (typeof state.input === "string") setInput(state.input);
+      if (typeof state.answer === "string") setAnswer(state.answer);
+    } catch {
+      sessionStorage.removeItem(RESEARCH_STATE_KEY);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!input && !answer) return;
+
+    sessionStorage.setItem(
+      RESEARCH_STATE_KEY,
+      JSON.stringify({ input, answer })
+    );
+  }, [input, answer]);
 
   // -----------------------------
   // Start Research
   // -----------------------------
 
-async function research() {
-  if (!input.trim() || loading) return;
+  async function research() {
+    if (!input.trim() || loading) return;
 
-  setLoading(true);
-  setError("");
+    setLoading(true);
+    setError("");
 
-  try {
-    const res = await fetch(API_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        message: input,
-      }),
-    });
+    try {
+      const res = await fetch(API_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message: input,
+        }),
+      });
 
-    const data = await res.json().catch(() => ({}));
+      const data = await res.json().catch(() => ({}));
 
-    if (!res.ok || data.success === false) {
-      throw new Error(
-        data.error ||
-          (typeof data.detail === "string" ? data.detail : "Research failed.")
-      );
+      if (!res.ok || data.success === false) {
+        throw new Error(
+          data.error ||
+            (typeof data.detail === "string" ? data.detail : "Research failed.")
+        );
+      }
+
+      setAnswer(data.answer || "");
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
     }
-
-    setAnswer(data.answer || "");
-  } catch (err) {
-    setError(err.message);
-  } finally {
-    setLoading(false);
   }
-}
 
   function handleKeyDown(event) {
     if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
@@ -66,9 +98,9 @@ async function research() {
     }
   }
 
-
   return (
     <main className="page">
+      <div className="layout">
       <header className="masthead">
         <div className="masthead-inner">
           <span className="kicker">Research desk</span>
@@ -137,12 +169,12 @@ async function research() {
             <div
               className="result-body"
               dangerouslySetInnerHTML={{
-                __html: marked.parse(answer),
+                __html: renderMarkdown(answer),
               }}
             />
-
           </article>
         )}
+      </div>
       </div>
 
       <style jsx global>{`
@@ -175,15 +207,55 @@ async function research() {
           min-height: 100vh;
         }
 
+        /* ---------- Layout ---------- */
+        .layout {
+          display: grid;
+          grid-template-columns: 1fr;
+          min-height: 100vh;
+        }
+
         .masthead {
           border-bottom: 1px solid var(--rule);
           background: var(--paper);
         }
 
         .masthead-inner {
-          max-width: 680px;
+          padding: 44px 20px 32px;
+        }
+
+        .page-inner {
+          width: 100%;
+          max-width: 760px;
           margin: 0 auto;
-          padding: 64px 24px 40px;
+          padding: 32px 20px 80px;
+        }
+
+        /* Wide screens: heading on the left, search area on the right */
+        @media (min-width: 1000px) {
+          .layout {
+            grid-template-columns: minmax(340px, 5fr) 7fr;
+          }
+
+          .masthead {
+            border-bottom: none;
+            border-right: 1px solid var(--rule);
+          }
+
+          .masthead-inner {
+            position: sticky;
+            top: 0;
+            padding: clamp(56px, 14vh, 140px) clamp(32px, 4vw, 80px);
+          }
+
+          .page-inner {
+            max-width: none;
+            margin: 0;
+            padding: clamp(56px, 14vh, 140px) clamp(32px, 5vw, 96px) 100px;
+          }
+
+          .page-inner > * {
+            max-width: 760px;
+          }
         }
 
         .kicker {
@@ -197,25 +269,19 @@ async function research() {
         h1 {
           font-family: "Source Serif 4", Georgia, serif;
           font-weight: 600;
-          font-size: 40px;
+          font-size: clamp(32px, 3.2vw, 52px);
           line-height: 1.15;
           margin: 10px 0 14px;
-          max-width: 14ch;
+          max-width: 16ch;
         }
 
         .subtitle {
           font-family: "Source Serif 4", Georgia, serif;
-          font-size: 18px;
+          font-size: clamp(17px, 1.3vw, 20px);
           line-height: 1.55;
           color: var(--ink-soft);
-          max-width: 46ch;
+          max-width: 40ch;
           margin: 0;
-        }
-
-        .page-inner {
-          max-width: 680px;
-          margin: 0 auto;
-          padding: 40px 24px 100px;
         }
 
         .field-label {
@@ -375,34 +441,131 @@ async function research() {
           color: var(--ink);
         }
 
-        .result-body :global(h1),
-        .result-body :global(h2),
-        .result-body :global(h3) {
+        .result-body h1,
+        .result-body h2,
+        .result-body h3,
+        .result-body h4 {
           font-family: "Source Serif 4", Georgia, serif;
           line-height: 1.3;
+          margin: 1.8em 0 0.6em;
         }
 
-        .result-body :global(p) {
+        .result-body h1 { font-size: 1.7em; }
+        .result-body h2 { font-size: 1.4em; }
+        .result-body h3 { font-size: 1.2em; }
+        .result-body h4 { font-size: 1.05em; }
+
+        .result-body > :first-child {
+          margin-top: 0;
+        }
+
+        .result-body p {
           margin: 0 0 1.2em;
         }
 
-        .result-body :global(a) {
-          color: var(--accent);
+        .result-body ul,
+        .result-body ol {
+          margin: 0 0 1.2em;
+          padding-left: 1.5em;
         }
 
-        .result-body :global(code) {
+        .result-body li {
+          margin-bottom: 0.4em;
+        }
+
+        .result-body a {
+          color: var(--accent);
+          text-underline-offset: 3px;
+          word-break: break-word;
+        }
+
+        .result-body hr {
+          border: none;
+          border-top: 1px solid var(--rule);
+          margin: 2em 0;
+        }
+
+        .result-body blockquote {
+          margin: 0 0 1.2em;
+          padding: 4px 0 4px 16px;
+          border-left: 3px solid var(--accent);
+          color: var(--ink-soft);
+        }
+
+        .result-body code {
           background: var(--accent-soft);
           padding: 2px 5px;
           font-size: 0.9em;
         }
 
+        .result-body pre {
+          background: var(--accent-soft);
+          border: 1px solid var(--rule);
+          padding: 14px 16px;
+          overflow-x: auto;
+          margin: 0 0 1.2em;
+        }
+
+        .result-body pre code {
+          background: none;
+          padding: 0;
+        }
+
+        /* ---------- Tables (report + sources) ---------- */
+        .result-body .table-wrap {
+          width: 100%;
+          overflow-x: auto;
+          margin: 0 0 1.6em;
+          border: 1px solid var(--rule);
+          background: var(--paper-card);
+        }
+
+        .result-body table {
+          width: 100%;
+          border-collapse: collapse;
+          font-family: "Inter", -apple-system, sans-serif;
+          font-size: 14px;
+          line-height: 1.55;
+        }
+
+        .result-body th,
+        .result-body td {
+          padding: 12px 14px;
+          text-align: left;
+          vertical-align: top;
+          border: 1px solid var(--rule);
+        }
+
+        .result-body thead th {
+          background: var(--accent-soft);
+          color: var(--accent);
+          font-weight: 600;
+          font-size: 13px;
+          border-bottom: 2px solid var(--accent);
+          white-space: nowrap;
+        }
+
+        .result-body tbody tr:nth-child(even) {
+          background: var(--paper);
+        }
+
+        .result-body tbody tr:hover {
+          background: var(--accent-soft);
+        }
+
+        .result-body td a {
+          word-break: break-all;
+        }
+
+        /* remove the outer double border (wrapper already has one) */
+        .result-body table tr > :first-child { border-left: none; }
+        .result-body table tr > :last-child { border-right: none; }
+        .result-body table thead tr:first-child > th { border-top: none; }
+        .result-body table tbody tr:last-child > td { border-bottom: none; }
+
         @media (max-width: 600px) {
           h1 {
             font-size: 30px;
-          }
-
-          .masthead-inner {
-            padding: 44px 20px 32px;
           }
 
           .query-footer {
@@ -418,5 +581,4 @@ async function research() {
       `}</style>
     </main>
   );
-
 }

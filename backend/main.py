@@ -105,7 +105,7 @@ model = ChatGroq(
     model="openai/gpt-oss-120b",
     api_key=GROQ_API_KEY,
     temperature=1,
-    max_tokens=2048,
+    max_tokens=8192,
     reasoning_effort="medium",
     streaming=False,
 )
