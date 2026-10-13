@@ -37,13 +37,12 @@ logger = logging.getLogger(__name__)
 app = FastAPI()
 
 
-MONGO_URI = os.getenv("MONGO_URI", "").strip()
+MONGO_URI = os.getenv("MONGO_URI")
 
-# MongoDB is not used by the current request flow. Keep it optional so a
-# serverless deployment can start without an unused database connection.
-client = MongoClient(MONGO_URI) if MONGO_URI else None
-db = client["research"] if client is not None else None
-history = db["History"] if db is not None else None
+client = MongoClient(MONGO_URI)
+db = client["research"]
+
+history = db["History"]
 
 
 # --------------------------------------------------

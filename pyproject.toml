@@ -40,6 +40,9 @@ dependencies = [
     "pypdf",
 ]
 
+[tool.vercel]
+entrypoint = "backend.app:app"
+
 [project.scripts]
 multi = "multi:main"
 

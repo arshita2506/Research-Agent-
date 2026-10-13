@@ -156,6 +156,21 @@ npm run dev
 
 Open [http://localhost:3000](http://localhost:3000). The backend health check is available at [http://127.0.0.1:8000/](http://127.0.0.1:8000/).
 
+## Deploy the backend to Vercel
+
+The repository root is configured as a FastAPI Vercel project. Import this repository into Vercel with the **Root Directory** set to `.` and add these Environment Variables in the Vercel project settings:
+
+- `GROQ_API_KEY`
+- `TAVILY_API_KEY`
+- `NEWS_API_KEY`
+- `YOUTUBE_API_KEY` (optional; YouTube search can return no results without it)
+- `FRONTEND_ORIGINS` (comma-separated deployed frontend origins; optional if using the default Vercel origin allowance)
+- `MONGO_URI` (optional; the current request flow does not use MongoDB)
+
+Deploy, then check `https://<your-backend-domain>/`. Set `NEXT_PUBLIC_API_URL` in the separate Next.js Vercel project to `https://<your-backend-domain>` (without `/api/research`), then redeploy the frontend. Set that project's Root Directory to `tripmate-next`.
+
+Vercel runs the API as a serverless function with a five-minute maximum duration. Long model/search requests may time out at that limit. The app's MCP adapter starts `backend/MCP_servers.py` as a local subprocess, so verify a real `/api/research` request after deployment; the health endpoint only confirms that the FastAPI app loaded.
+
 ## API
 
 ### `POST /api/research`
