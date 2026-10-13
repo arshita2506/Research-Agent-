@@ -45,7 +45,12 @@ from langchain_core.prompts import ChatPromptTemplate
 # ENVIRONMENT
 # =========================================================
 
-load_dotenv()
+# load_dotenv()
+from pathlib import Path
+from dotenv import load_dotenv
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(BASE_DIR / ".env")
 
 
 os.environ["SSL_CERT_FILE"] = certifi.where()
